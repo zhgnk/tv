@@ -23,7 +23,9 @@ SOURCES = [
     'https://raw.githubusercontent.com/zhgnk/tv/refs/heads/main/live.m3u',
     'https://live.hacks.tools/tv/ipv4/categories/央视频道.m3u',
     'https://live.hacks.tools/tv/ipv4/categories/卫视频道.m3u',
-    'https://raw.githubusercontent.com/CCSH/IPTV/refs/heads/main/live_lite.m3u'
+    'https://raw.githubusercontent.com/CCSH/IPTV/refs/heads/main/live_lite.m3u',
+    'https://raw.githubusercontent.com/Guovin/TV/gd/output/result.m3u',
+    'https://iptv-cn.github.io/IPTV/languages/zho.m3u'
 ]
 
 UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
