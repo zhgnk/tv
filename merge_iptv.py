@@ -4,7 +4,7 @@
 IPTV 合并器
 - 只保留：央视、卫视
 - 不修改、不裁剪原始 URL 的 query 参数
-- 不因为 HTTP HEAD/GET 的偶发 403/超时就武断删除可播放源
+- 检查 HTTP/HTTPS 地址是否返回非空视频数据，M3U8 继续抽查视频分片，不解码试播
 - M3U8 只有在确认是 Master Playlist 时才展开
 - Media Playlist / 普通直播 URL 保留原始 URL
 - Master Playlist 递归展开，最终只写最终 Media Playlist URL
@@ -14,10 +14,14 @@ IPTV 合并器
 import argparse
 import re
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from urllib.parse import urljoin
 
 import requests
+from urllib3.exceptions import HTTPError as TransportError
 
 SOURCES = [
     'https://raw.githubusercontent.com/zhgnk/tv/refs/heads/main/live.m3u',
@@ -25,7 +29,8 @@ SOURCES = [
     'https://live.hacks.tools/tv/ipv4/categories/卫视频道.m3u',
     'https://raw.githubusercontent.com/CCSH/IPTV/refs/heads/main/live_lite.m3u',
     'https://raw.githubusercontent.com/Guovin/TV/gd/output/result.m3u',
-    'https://iptv-cn.github.io/IPTV/languages/zho.m3u'
+    'https://iptv-org.github.io/iptv/languages/zho.m3u',
+    'https://raw.githubusercontent.com/best-fan/iptv-sources/master/cn_all.m3u8'
 ]
 
 UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -34,24 +39,79 @@ UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
 
 GROUP_ORDER = ['央视', '卫视']
 TIMEOUT = (6, 12)
+MAX_PLAYLIST_BYTES = 2 * 1024 * 1024
+MAX_SOURCE_BYTES = 16 * 1024 * 1024
+READ_BUDGET = 18  # 两次读取之间检查；单次阻塞仍受 TIMEOUT 的读取超时约束。
+_HTTP_LOCAL = threading.local()
 
 
+@contextmanager
 def session_for():
+    cached = getattr(_HTTP_LOCAL, 'session', None)
+    if cached is not None:
+        yield cached
+        return
     s = requests.Session()
     s.headers.update({
         'User-Agent': UA,
         'Accept': '*/*',
         'Connection': 'keep-alive',
     })
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
+
+
+@contextmanager
+def http_executor(workers):
+    sessions = []
+
+    def initialize():
+        manager = session_for()
+        _HTTP_LOCAL.session = manager.__enter__()
+        sessions.append(manager)
+
+    try:
+        with ThreadPoolExecutor(max_workers=workers, initializer=initialize) as executor:
+            yield executor
+    finally:
+        for manager in sessions:
+            manager.__exit__(None, None, None)
+
+
+def read_response(response, limit, probe=False):
+    """限量读取；read1 每次读取可用数据，避免持续直播流填满缓冲才返回。"""
+    body = bytearray()
+    deadline = time.monotonic() + READ_BUDGET
+    while True:
+        if time.monotonic() >= deadline:
+            raise requests.Timeout('响应读取超过时间预算')
+        chunk = response.raw.read1(min(4096 if probe else 65536, limit + 1 - len(body)), decode_content=True)
+        if not chunk:
+            return bytes(body)
+        body.extend(chunk)
+        if len(body) > limit:
+            raise requests.RequestException(f'响应超过 {limit} 字节限制')
+        if probe:
+            prefix = bytes(body[:128]).decode('utf-8-sig', errors='ignore').lstrip()
+            if prefix and not '#EXTM3U'.startswith(prefix) and not prefix.startswith('#EXTM3U'):
+                if len(body) >= 512 or response.headers.get('Content-Type', '').lower().startswith('video/'):
+                    return bytes(body)
 
 
 def get_text(url):
-    s = session_for()
-    r = s.get(url, timeout=TIMEOUT, allow_redirects=True)
-    r.raise_for_status()
-    r.encoding = r.encoding if r.encoding and r.encoding.lower() != 'iso-8859-1' else (r.apparent_encoding or 'utf-8')
-    return r.text
+    with session_for() as s:
+        with s.get(url, timeout=TIMEOUT, allow_redirects=True, stream=True) as r:
+            r.raise_for_status()
+            body = read_response(r, MAX_SOURCE_BYTES)
+            encoding = r.encoding
+            if not encoding or encoding.lower() == 'iso-8859-1':
+                try:
+                    return body.decode('utf-8-sig')
+                except UnicodeDecodeError:
+                    encoding = requests.compat.chardet.detect(body).get('encoding') or 'utf-8'
+            return body.decode(encoding, errors='replace')
 
 
 def parse_m3u(text):
@@ -129,25 +189,24 @@ def make_extinf(item, group, name):
 
 
 def parse_master(text, base_url):
-    lines = [x.strip() for x in text.splitlines() if x.strip()]
     variants = []
-    for i, line in enumerate(lines):
-        if not line.upper().startswith('#EXT-X-STREAM-INF:'):
+    bw = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
             continue
-        bw = 0
-        m = re.search(r'(?:AVERAGE-)?BANDWIDTH=(\d+)', line, re.I)
-        if m:
-            bw = int(m.group(1))
-        for j in range(i + 1, len(lines)):
-            if lines[j].startswith('#'):
-                continue
-            child = urljoin(base_url, lines[j])
+        if line.upper().startswith('#EXT-X-STREAM-INF:'):
+            m = re.search(r'(?:AVERAGE-)?BANDWIDTH=(\d+)', line, re.I)
+            bw = int(m.group(1)) if m else 0
+        elif not line.startswith('#') and bw is not None:
+            child = urljoin(base_url, line)
             if re.match(r'^(?:https?|rtmp)://', child, re.I):
                 variants.append((bw, child))
-            break
+            bw = None
     # 某些 master 不规范，只列出 m3u8 地址
     if not variants:
-        for line in lines:
+        for raw in text.splitlines():
+            line = raw.strip()
             if line.startswith('#'):
                 continue
             if re.search(r'\.m3u8(?:[?#]|$)', line, re.I):
@@ -179,8 +238,7 @@ def is_media_playlist(text):
                 re.search(r'^\s*#EXT-X-PART:', text, re.I | re.M))
 
 
-def fetch_playlist(url, options=None):
-    s = session_for()
+def fetch_playlist(url, options=None, timeout=None):
     headers = {}
     options = options or {}
     ua = options.get('http-user-agent') or options.get('user-agent')
@@ -189,45 +247,81 @@ def fetch_playlist(url, options=None):
         headers['User-Agent'] = ua
     if ref:
         headers['Referer'] = ref
-    r = s.get(url, headers=headers, timeout=TIMEOUT, allow_redirects=True)
-    r.raise_for_status()
-    ctype = r.headers.get('Content-Type', '')
-    text = r.content.decode('utf-8-sig', errors='ignore')
-    return text, ctype, r.url
+    with session_for() as s:
+        request_timeout = TIMEOUT if timeout is None else (min(6, timeout), timeout)
+        with s.get(url, headers=headers, timeout=request_timeout, allow_redirects=True, stream=True) as r:
+            r.raise_for_status()
+            ctype = r.headers.get('Content-Type', '')
+            media_type = ctype.lower().split(';', 1)[0].strip()
+            body = read_response(r, MAX_PLAYLIST_BYTES, probe=True)
+            prefix = body[:128].decode('utf-8-sig', errors='ignore').lstrip()
+            if prefix.startswith('#EXTM3U'):
+                return body.decode('utf-8-sig', errors='ignore'), ctype, r.url, False
+            # 只判断返回的数据类型和常见容器特征，不验证编码或实际可播放性。
+            rejected = (not body or prefix.startswith(('<', '{', '[')) or
+                        media_type.startswith(('text/', 'audio/')) or
+                        'json' in media_type or 'xml' in media_type or 'mpegurl' in media_type)
+            known_video = (body.startswith(b'FLV') or
+                           (len(body) >= 377 and body[0] == body[188] == body[376] == 0x47) or
+                           body[4:8] in (b'ftyp', b'styp', b'moof', b'mdat'))
+            binary = any(byte < 9 or 13 < byte < 32 for byte in body[:512])
+            stream_ok = not rejected and (known_video or media_type.startswith('video/') or
+                                          (media_type in ('', 'application/octet-stream') and binary))
+            return '', ctype, r.url, stream_ok
 
 
-def flatten(url, options=None, depth=0, visited=None):
-    """只有确认 Master 才替换 URL；普通 Media Playlist 原 URL 原样返回。"""
+def flatten(url, options=None, depth=0, visited=None, timeout=None):
+    """展开 Master，确认返回流数据后保留最终线路的原始 URL。"""
     if visited is None:
         visited = set()
     if depth > 8 or url in visited:
         return None
     visited.add(url)
-
-    try:
-        text, ctype, response_url = fetch_playlist(url, options)
-    except Exception:
+    if not re.match(r'^https?://', url, re.I):
         return None
 
-    if not is_hls(text, ctype, response_url):
-        # 普通直链：请求成功就保留原始 URL，而不是重写成 redirect 后的 URL
+    try:
+        text, ctype, response_url, stream_ok = fetch_playlist(url, options, timeout)
+    except (requests.RequestException, TransportError, OSError):
+        return None
+
+    if stream_ok:
         return url
+    if not is_hls(text, ctype, response_url):
+        return None
 
     if is_master_playlist(text):
         variants = parse_master(text, response_url)
         for _, child in variants:
-            got = flatten(child, options, depth + 1, visited.copy())
+            got = flatten(child, options, depth + 1, visited.copy(), timeout)
             if got:
                 return got
         return None
 
     if is_media_playlist(text):
-        # 已经是最终 Media Playlist：保留入口 URL，尤其不能丢 query 参数
-        return url
+        segments = []
+        parts = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line and not line.startswith('#'):
+                segments.append(urljoin(response_url, line))
+            elif line.upper().startswith('#EXT-X-PART:'):
+                match = re.search(r'\bURI="([^"]+)"', line)
+                if match:
+                    parts.append(urljoin(response_url, match.group(1)))
+        # 优先最近的完整分片；最多尝试三个，避免过期分片导致整条线路误删。
+        for segment in list(dict.fromkeys(segments or parts))[-3:][::-1]:
+            if not re.match(r'^https?://', segment, re.I):
+                continue
+            try:
+                if fetch_playlist(segment, options, timeout)[3]:
+                    return url
+            except (requests.RequestException, TransportError, OSError):
+                continue
+        return None
 
-    # 不确定格式：不要把 master.m3u8 当最终地址，但也不轻易删掉
-    # 只有明确存在 EXT-X-STREAM-INF 才会进入 master 分支。
-    return url
+    # 声称是 HLS 却没有有效播放列表结构，按检测失败处理。
+    return None
 
 
 def load_source(source):
@@ -244,46 +338,55 @@ def load_source(source):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('-o', '--output', default='merged_iptv.m3u')
-    ap.add_argument('-w', '--workers', type=int, default=28)
+    ap.add_argument('-w', '--workers', '--probe-workers', type=int, default=28, help='网络检测并发数，默认 28')
+    ap.add_argument('--timeout', '--probe-timeout', type=float, default=12, help='单次网络读取超时秒数，默认 12')
     ap.add_argument('--no-check', action='store_true', help='不检测播放地址，只做合并/分类/去重')
     args = ap.parse_args()
+    if args.workers < 1:
+        ap.error('--workers 必须大于 0')
+    if not 0 < args.timeout < float('inf'):
+        ap.error('--timeout 必须是有效正数')
 
     all_items = []
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        fs = [ex.submit(load_source, x) for x in SOURCES]
-        for f in as_completed(fs):
-            all_items.extend(f.result())
+    with http_executor(min(5, args.workers)) as ex:
+        for rows in ex.map(load_source, SOURCES):
+            all_items.extend(rows)
+    if not all_items:
+        raise SystemExit('未读取到任何频道，保留已有输出文件。')
 
     # 第一轮：URL 原样去重，不改参数
     by_url = {}
     for item in all_items:
-        by_url.setdefault(item['url'], item)
+        if classify(item['name'], item['group']) in GROUP_ORDER:
+            by_url.setdefault(item['url'], item)
     items = list(by_url.values())
 
     # 只保留央视/卫视
-    items = [x for x in items if classify(x['name'], x['group']) in GROUP_ORDER]
-    print(f'抓取 {len(all_items)} 条；URL 去重 {len(by_url)} 条；央视/卫视 {len(items)} 条')
+    print(f'抓取 {len(all_items)} 条；央视/卫视筛选及 URL 去重后 {len(items)} 条')
 
     if not args.no_check:
-        alive = []
-        print(f'检测播放地址并展开 Master M3U8，workers={args.workers}')
-        with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            futs = {ex.submit(flatten, x['url'], x.get('options')): x for x in items}
+        alive = [None] * len(items)
+        retained = 0
+        unsupported = sum(not re.match(r'^https?://', x['url'], re.I) for x in items)
+        print(f'检测 HTTP/HTTPS 视频流并展开 Master：并发 {args.workers}，读取超时 {args.timeout:g} 秒')
+        if unsupported:
+            print(f'  非 HTTP/HTTPS 线路 {unsupported} 条，当前检测模式不支持，将排除')
+        with http_executor(args.workers) as ex:
+            futs = {ex.submit(flatten, x['url'], x.get('options'), timeout=args.timeout): i for i, x in enumerate(items)}
             done = 0
             for f in as_completed(futs):
                 done += 1
-                x = futs[f]
-                try:
-                    final = f.result()
-                except Exception:
-                    final = None
+                index = futs[f]
+                x = items[index]
+                final = f.result()
                 if final:
                     y = dict(x)
                     y['url'] = final
-                    alive.append(y)
+                    alive[index] = y
+                    retained += 1
                 if done % 100 == 0 or done == len(futs):
-                    print(f'  {done}/{len(futs)}，保留 {len(alive)}')
-        items = alive
+                    print(f'  {done}/{len(futs)}，返回流数据 {retained}，剔除 {done - retained}')
+        items = [x for x in alive if x is not None]
 
     # 第二轮：最终 URL 去重；同频道允许多个不同线路
     final_map = {}
@@ -292,16 +395,11 @@ def main():
     items = list(final_map.values())
 
     groups = {g: [] for g in GROUP_ORDER}
-    pair_seen = set()
     for x in items:
         group = classify(x['name'], x['group'])
         if not group:
             continue
         name = normalize_name(x['name'])
-        key = (name.casefold(), x['url'])
-        if key in pair_seen:
-            continue
-        pair_seen.add(key)
         y = dict(x)
         y['name'] = name
         groups[group].append(y)
@@ -319,6 +417,8 @@ def main():
             groups[group].sort(key=sortkey)
             for x in groups[group]:
                 f.write(make_extinf(x, group, x['name']) + '\n')
+                for key, value in x.get('options', {}).items():
+                    f.write(f'#EXTVLCOPT:{key}={value}\n')
                 f.write(x['url'] + '\n')
 
     print('\n完成:', args.output)
