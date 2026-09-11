@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IPTV 合并器 V2
+IPTV 合并器
 - 只保留：央视、卫视
 - 不修改、不裁剪原始 URL 的 query 参数
 - 不因为 HTTP HEAD/GET 的偶发 403/超时就武断删除可播放源
@@ -21,8 +21,8 @@ import requests
 
 SOURCES = [
     'https://raw.githubusercontent.com/zhgnk/tv/refs/heads/main/live.m3u',
-    'https://live.hacks.tools/tv/ipv4/categories/%E5%A4%AE%E8%A7%86%E9%A2%91%E9%81%93.m3u',
-    'https://live.hacks.tools/tv/ipv4/categories/%E5%8D%AB%E8%A7%86%E9%A2%91.m3u',
+    'https://live.hacks.tools/tv/ipv4/categories/央视频道.m3u',
+    'https://live.hacks.tools/tv/ipv4/categories/卫视频道.m3u',
     'https://raw.githubusercontent.com/CCSH/IPTV/refs/heads/main/live_lite.m3u'
 ]
 
@@ -242,7 +242,7 @@ def load_source(source):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('-o', '--output', default='merged_iptv.m3u')
-    ap.add_argument('-w', '--workers', type=int, default=24)
+    ap.add_argument('-w', '--workers', type=int, default=28)
     ap.add_argument('--no-check', action='store_true', help='不检测播放地址，只做合并/分类/去重')
     args = ap.parse_args()
 
